@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from flask import Flask
 from threading import Thread
 from pyrogram import Client, filters
-from pyrogram.errors import FloodWait
+from pyrogram.errors import FloodWait, RPCError
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.raw.types import (
     InputReportReasonSpam, 
@@ -16,12 +16,13 @@ from pyrogram.raw.types import (
     InputReportReasonOther
 )
 from pyrogram.raw.functions.messages import Report
+from pyrogram.raw.functions.channels import JoinChannel
 import motor.motor_asyncio
 
-# --- FAST WEB SERVER ---
+# --- WEB SERVER ---
 app = Flask(__name__)
 @app.route('/')
-def home(): return "Bot is Online"
+def home(): return "Log System Online"
 
 def run_web():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
@@ -32,6 +33,7 @@ API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 MONGO_URL = os.environ.get("MONGO_URL")
 ADMIN_ID = int(os.environ.get("ADMIN_ID"))
+LOG_CHANNEL = -1003704307588 # Aapka Log Channel ID
 OWNER_USERNAME = "SANATANI_GOJO" 
 SESSIONS = [s.strip() for s in os.environ.get("SESSIONS", "").split(",") if s.strip()]
 
@@ -41,98 +43,83 @@ subs_col = db["users"]
 
 bot = Client("MassReportBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# --- KEYBOARDS ---
-def main_menu(user_id):
-    buttons = [
-        [InlineKeyboardButton("🚀 Launch Attack", callback_data="attack_info")],
-        [InlineKeyboardButton("💳 Buy Subscription", url=f"https://t.me/{OWNER_USERNAME}")],
-        [InlineKeyboardButton("📊 My Account", callback_data="my_stats")]
-    ]
-    if user_id == ADMIN_ID:
-        buttons.append([InlineKeyboardButton("🔑 Gen 30-Day Key", callback_data="gen_key")])
-    return InlineKeyboardMarkup(buttons)
+# --- REASONS ---
+REASONS = [
+    InputReportReasonSpam(),
+    InputReportReasonViolence(),
+    InputReportReasonChildAbuse(),
+    InputReportReasonCopyright(),
+    InputReportReasonOther()
+]
 
-# --- HANDLERS ---
 @bot.on_message(filters.command("start"))
-async def start_handler(client, message):
-    await message.reply_text(
-        f"🔥 **Mass Reporting Pro v5.0**\n\nTotal IDs: `{len(SESSIONS)}`",
-        reply_markup=main_menu(message.from_user.id)
-    )
-
-@bot.on_callback_query()
-async def cb_handler(client, query):
-    # Turant answer dena taaki button loading na dikhaye
-    await query.answer()
-    
-    if query.data == "attack_info":
-        await query.edit_message_text(
-            "📝 **How to Report?**\n\nUse command: `/report @username`",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="home")]])
-        )
-    elif query.data == "my_stats":
-        user_data = await subs_col.find_one({"user_id": query.from_user.id})
-        if user_data:
-            expiry = user_data["expiry"].strftime("%Y-%m-%d")
-            await query.message.reply_text(f"✅ Your Plan is Active until: {expiry}")
-        else:
-            await query.message.reply_text("❌ No Subscription Found!")
-    elif query.data == "gen_key":
-        if query.from_user.id != ADMIN_ID: return
-        key = ''.join(random.choices(string.digits, k=6))
-        await subs_col.insert_one({"auth_key": key, "expiry": datetime.now() + timedelta(days=30), "claimed": False})
-        await query.message.reply_text(f"🔑 **Key Generated:** `{key}`")
-    elif query.data == "home":
-        await query.edit_message_text("Main Menu:", reply_markup=main_menu(query.from_user.id))
-
-@bot.on_message(filters.command("redeem"))
-async def redeem_key(client, message):
-    if len(message.command) < 2: return
-    key_data = await subs_col.find_one({"auth_key": message.command[1], "claimed": False})
-    if key_data:
-        await subs_col.update_one({"auth_key": message.command[1]}, {"$set": {"claimed": True, "user_id": message.from_user.id}})
-        await message.reply("✅ Premium Activated!")
-    else:
-        await message.reply("🚫 Invalid Key!")
+async def start(client, message):
+    await message.reply_text(f"🔥 **Mass Report v6.0**\nLog Channel: `Active` ✅")
 
 @bot.on_message(filters.command("report"))
 async def execute_report(client, message):
     user_info = await subs_col.find_one({"user_id": message.from_user.id})
     if not user_info or datetime.now() > user_info["expiry"]:
-        return await message.reply("🚫 Subscription Required!")
+        if message.from_user.id != ADMIN_ID:
+            return await message.reply("🚫 Subscription Required!")
 
-    if len(message.command) < 2: return await message.reply("❌ Use: `/report @username`")
+    if len(message.command) < 2:
+        return await message.reply("❌ Use: `/report [LINK/USERNAME]`")
 
-    target = message.command[1].replace("@", "").split("/")[-1]
+    target_input = message.command[1].replace("[", "").replace("]", "")
+    target_clean = target_input.replace("@", "").split("/")[-1]
     
-    if target.lower() == OWNER_USERNAME.lower():
-        return await message.reply("Beta, baap ko report maarega? 😂🖕")
+    if target_clean.lower() == OWNER_USERNAME.lower():
+        return await message.reply("Beta, admin ko report nahi marte! 😂")
 
-    status_msg = await message.reply(f"🚀 **Targeting:** `@{target}`\nNodes: `{len(SESSIONS)}`")
+    status_msg = await message.reply(f"🚀 **Attack Started!**\nTarget: `@{target_clean}`\nJoining & Reporting...")
 
-    successful_ids = 0
-    total_hits = 0
-    reasons = [InputReportReasonSpam(), InputReportReasonViolence(), InputReportReasonChildAbuse(), InputReportReasonCopyright(), InputReportReasonOther()]
+    success_count = 0
+    total_reports = 0
+    log_details = ""
 
     for i, session in enumerate(SESSIONS):
         try:
             async with Client(f"node_{i}", api_id=API_ID, api_hash=API_HASH, session_string=session) as acc:
+                # 1. AUTO-JOIN LOGIC
                 try:
-                    user_entity = await acc.get_users(target)
-                    peer = await acc.resolve_peer(user_entity.id)
-                except:
-                    peer = await acc.resolve_peer(target)
+                    await acc.join_chat(target_input)
+                    join_status = "Joined ✅"
+                except Exception:
+                    join_status = "Already in/Failed ❌"
 
-                for r in reasons:
-                    await acc.invoke(Report(peer=peer, id=[0], reason=r, message="Harassment and Violation"))
-                    total_hits += 1
-                successful_ids += 1
-            await asyncio.sleep(0.3) # Fast sleep
-        except: continue
+                # 2. RESOLVE PEER & REPORT
+                peer = await acc.resolve_peer(target_clean)
+                id_hits = 0
+                for r in REASONS:
+                    await acc.invoke(Report(peer=peer, id=[0], reason=r, message="Severe Violation"))
+                    id_hits += 1
+                    total_reports += 1
+                
+                success_count += 1
+                log_details += f"🔹 **Node {i}:** {join_status} | {id_hits} Reports\n"
 
-    await status_msg.edit(f"🏁 **Finished!**\n\n✅ IDs: `{successful_ids}`\n💥 Hits: `{total_hits}`\n🎯 Target: `@{target}`")
+        except Exception as e:
+            log_details += f"🔸 **Node {i}:** Failed ({type(e).__name__})\n"
+            continue
+
+    # --- SENDING LOGS TO CHANNEL ---
+    log_text = (
+        f"📊 **Attack Log Report**\n\n"
+        f"👤 **User:** {message.from_user.mention}\n"
+        f"🎯 **Target:** `@{target_clean}`\n"
+        f"✅ **Success IDs:** `{success_count}/{len(SESSIONS)}`\n"
+        f"💥 **Total Hits:** `{total_reports}`\n\n"
+        f"📜 **Details:**\n{log_details}"
+    )
+    
+    try:
+        await bot.send_message(LOG_CHANNEL, log_text)
+    except Exception as le:
+        print(f"Log Error: {le}")
+
+    await status_msg.edit(f"🏁 **Attack Finished!**\n\nTotal Reports: `{total_reports}`\nCheck Logs: [Click Here](https://t.me/c/3704307588/1)")
 
 if __name__ == "__main__":
     Thread(target=run_web).start()
     bot.run()
-        
